@@ -1,0 +1,9 @@
+checkpoint/
+samples/
+pretrained/
+__pycache__/
+*.pyc
+*.pyo
+sbatch/
+._*
+.DS_Store

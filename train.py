@@ -32,8 +32,12 @@ parser.add_argument('--batch-size', default=4, type=int,
                          'batch size of all GPUs')
 parser.add_argument('--workers', default=8, type=int,
                     help='number of data loading workers (default: 8)')
-parser.add_argument('--img-size', default=256, type=int,
-                    help='size of training images (default: 256, can be 128 or 256)')
+# === THAY ĐỔI: --img-size nhận cả volume bất đối xứng ======================
+# Trước: type=int, chỉ 128 hoặc 256 (volume lập phương).
+# Nay:   type=str, chấp nhận "128", "256" (như cũ) hoặc "160x192x224".
+parser.add_argument('--img-size', default='256', type=str,
+                    help='size of training images: "128", "256" (cubic) '
+                         'or "160x192x224" (anisotropic). Default: 256')
 parser.add_argument('--num-iter', default=80000, type=int,
                     help='number of iteration for training (default: 80000)')
 parser.add_argument('--log-iter', default=20, type=int,
@@ -54,8 +58,10 @@ parser.add_argument('--data-dir', type=str,
                     help='path to the preprocessed data folder')
 parser.add_argument('--exp-name', default='HA_GAN_run1', type=str,
                     help='name of the experiment')
+# THAY ĐỔI: bổ sung quy ước fold = -1 (xem volume_dataset.py)
 parser.add_argument('--fold', default=0, type=int,
-                    help='fold number for cross validation')
+                    help='fold number for cross validation (0-4), '
+                         'or -1 to use the whole dataset without a held-out split')
 
 # configs for conditional generation
 parser.add_argument('--lambda-class', default=0.1, type=float,
@@ -63,22 +69,58 @@ parser.add_argument('--lambda-class', default=0.1, type=float,
 parser.add_argument('--num-class', default=0, type=int,
                     help='number of class for auxiliary classifier (0 if unconditional)')
 
+# === THÊM MỚI: helper cho volume bất đối xứng ==============================
+def parse_img_size(s):
+    """"160x192x224" -> (160,192,224);  "128" -> (128,128,128)."""
+    s = str(s).lower()
+    if 'x' in s:
+        dims = tuple(int(v) for v in s.split('x'))
+        if len(dims) != 3:
+            raise ValueError('--img-size phải có đúng 3 chiều, vd 160x192x224')
+        return dims
+    return (int(s),) * 3
+
+
+def center_cuts(shape):
+    """cut_coords cho nilearn.plot_img = tâm của từng trục.
+
+    Bản gốc hardcode (img_size//2, img_size//2, img_size//16) vì volume lập
+    phương và lát cắt dày img_size//8. Nay tính thẳng từ shape thật.
+    """
+    return tuple(d // 2 for d in shape)
+# ===========================================================================
+
+
 def main():
     # Configuration
     args = parser.parse_args()
+
+    # === THAY ĐỔI: mọi kích thước nay là tuple 3 chiều, không còn 1 số int ===
+    img_shape = parse_img_size(args.img_size)       # vd (160,192,224)
+    crop_size = img_shape[0] // 8                   # độ dày lát cắt high-res (trục 0)
+    low_shape = tuple(d // 4 for d in img_shape)    # low-res full volume = IMG/4
+    crop_idx_max = img_shape[0] * 7 // 8            # crop_idx lớn nhất (inclusive)
+    print('Image shape:', img_shape, '| crop size:', crop_size,
+          '| low-res shape:', low_shape)
+    # =======================================================================
 
     trainset = Volume_Dataset(data_dir=args.data_dir, fold=args.fold, num_class=args.num_class)
     train_loader = torch.utils.data.DataLoader(trainset,batch_size=args.batch_size,drop_last=True,
                                                shuffle=False,num_workers=args.workers)
     gen_load = inf_train_gen(train_loader)
-    
-    if args.img_size == 256:
+
+    # === THAY ĐỔI: chọn model theo tuple shape, thêm nhánh 160x192x224 ======
+    if img_shape == (256, 256, 256):
         from models.Model_HA_GAN_256 import Discriminator, Generator, Encoder, Sub_Encoder
-    elif args.img_size == 128:
+    elif img_shape == (128, 128, 128):
         from models.Model_HA_GAN_128 import Discriminator, Generator, Encoder, Sub_Encoder
+    elif img_shape == (160, 192, 224):
+        from models.Model_HA_GAN_160_192_224 import Discriminator, Generator, Encoder, Sub_Encoder
     else:
-        raise NotImplmentedError
-        
+        # THAY ĐỔI: sửa luôn lỗi chính tả NotImplmentedError của bản gốc
+        # (tên sai -> raise ra NameError thay vì báo lỗi đúng nghĩa)
+        raise NotImplementedError('Chưa có model cho img_size = %s' % (img_shape,))
+
     G = Generator(mode='train', latent_dim=args.latent_dim, num_class=args.num_class).cuda()
     D = Discriminator(num_class=args.num_class).cuda()
     E = Encoder().cuda()
@@ -162,11 +204,14 @@ def main():
         D.zero_grad()
         real_images = real_images.float().cuda()
         # low-res full volume of real image
-        real_images_small = F.interpolate(real_images, scale_factor = 0.25)
-        
+        # THAY ĐỔI: scale_factor=0.25 -> size=low_shape. Kết quả y hệt (mọi chiều
+        # đều chia hết cho 4) nhưng tường minh và an toàn với volume bất đối xứng.
+        real_images_small = F.interpolate(real_images, size=low_shape)
+
         # randomly select a high-res sub-volume from real image
-        crop_idx = np.random.randint(0,args.img_size*7/8+1) # 256 * 7/8 + 1
-        real_images_crop = real_images[:,:,crop_idx:crop_idx+args.img_size//8,:,:]
+        # THAY ĐỔI: args.img_size*7/8 -> crop_idx_max, args.img_size//8 -> crop_size
+        crop_idx = np.random.randint(0, crop_idx_max+1) # 160 * 7/8 + 1
+        real_images_crop = real_images[:,:,crop_idx:crop_idx+crop_size,:,:]
 
         if args.num_class == 0: # unconditional
             y_real_pred = D(real_images_crop, real_images_small, crop_idx)
@@ -256,8 +301,10 @@ def main():
         with torch.no_grad():
             z_hat_i_list = []
             # Process all sub-volume and concatenate
-            for crop_idx_i in range(0,args.img_size,args.img_size//8):
-                real_images_crop_i = real_images[:,:,crop_idx_i:crop_idx_i+args.img_size//8,:,:]
+            # THAY ĐỔI: duyệt theo trục không gian đầu tiên của img_shape
+            # (8 lát cắt liên tiếp phủ kín trục, ghép lại thành low_shape)
+            for crop_idx_i in range(0, img_shape[0], crop_size):
+                real_images_crop_i = real_images[:,:,crop_idx_i:crop_idx_i+crop_size,:,:]
                 z_hat_i = E(real_images_crop_i)
                 z_hat_i_list.append(z_hat_i)
             z_hat = torch.cat(z_hat_i_list, dim=2).detach()   
@@ -293,22 +340,28 @@ def main():
                   'Sub_E: {:<8.3}'.format(sub_e_loss.item()),
                   'E: {:<8.3}'.format(e_loss.item()))
 
+            # THAY ĐỔI: cut_coords tính từ shape thật của lát cắt SAU transpose(2,1,0)
+            # -> (img_shape[2], img_shape[1], crop_size). Bản gốc hardcode
+            # (img_size//2, img_size//2, img_size//16) chỉ đúng với volume lập phương.
+            # Cả 3 ảnh log bên dưới (REAL/REC/FAKE) đều cùng shape nên dùng chung.
+            cuts = center_cuts((img_shape[2], img_shape[1], crop_size))
+
             featmask = np.squeeze((0.5*real_images_crop[0]+0.5).data.cpu().numpy())
             featmask = nib.Nifti1Image(featmask.transpose((2,1,0)),affine = np.eye(4))
             fig=plt.figure()
-            plotting.plot_img(featmask,title="REAL",cut_coords=(args.img_size//2,args.img_size//2,args.img_size//16),figure=fig,draw_cross=False,cmap="gray")
+            plotting.plot_img(featmask,title="REAL",cut_coords=cuts,figure=fig,draw_cross=False,cmap="gray")
             summary_writer.add_figure('Real', fig, iteration, close=True)
 
             featmask = np.squeeze((0.5*sub_x_hat_rec[0]+0.5).data.cpu().numpy())
             featmask = nib.Nifti1Image(featmask.transpose((2,1,0)),affine = np.eye(4))
             fig=plt.figure()
-            plotting.plot_img(featmask,title="REC",cut_coords=(args.img_size//2,args.img_size//2,args.img_size//16),figure=fig,draw_cross=False,cmap="gray")
+            plotting.plot_img(featmask,title="REC",cut_coords=cuts,figure=fig,draw_cross=False,cmap="gray")
             summary_writer.add_figure('Rec', fig, iteration, close=True)
             
             featmask = np.squeeze((0.5*fake_images[0]+0.5).data.cpu().numpy())
             featmask = nib.Nifti1Image(featmask.transpose((2,1,0)),affine = np.eye(4))
             fig=plt.figure()
-            plotting.plot_img(featmask,title="FAKE",cut_coords=(args.img_size//2,args.img_size//2,args.img_size//16),figure=fig,draw_cross=False,cmap="gray")
+            plotting.plot_img(featmask,title="FAKE",cut_coords=cuts,figure=fig,draw_cross=False,cmap="gray")
             summary_writer.add_figure('Fake', fig, iteration, close=True)
             
         if iteration > 30000 and (iteration+1)%500 == 0:

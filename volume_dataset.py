@@ -16,13 +16,22 @@ class Volume_Dataset(Dataset):
         self.sid_list.sort()
         self.sid_list = np.asarray(self.sid_list)
 
-        kf = KFold(n_splits=5, shuffle=True, random_state=0)
-        train_index, valid_index = list(kf.split(self.sid_list))[fold]
-        print("Fold:", fold)
-        if mode=="train":
-            self.sid_list = self.sid_list[train_index]
+        # === THAY ĐỔI: fold < 0 -> dùng TOÀN BỘ subject, bỏ qua chia KFold =====
+        # Mục đích: khớp đúng số lượng data với lần train 3D StyleGAN để đối chiếu
+        # công bằng giữa hai mô hình.
+        # ĐÁNH ĐỔI: không còn tập held-out, nên FID/đánh giá tính trên chính data
+        # đã train (lạc quan hơn thực tế). Muốn đánh giá trung thực thì dùng
+        # fold 0..4 như bản gốc.
+        if fold < 0:
+            print("Fold: -1 (dùng TOÀN BỘ dataset, không chia train/held-out)")
         else:
-            self.sid_list = self.sid_list[valid_index]
+            kf = KFold(n_splits=5, shuffle=True, random_state=0)
+            train_index, valid_index = list(kf.split(self.sid_list))[fold]
+            print("Fold:", fold)
+            if mode=="train":
+                self.sid_list = self.sid_list[train_index]
+            else:
+                self.sid_list = self.sid_list[valid_index]
         print("Dataset size:", len(self))
 
         self.class_label_dict = dict()
