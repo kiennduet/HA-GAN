@@ -7,3 +7,4 @@ __pycache__/
 sbatch/
 ._*
 .DS_Store
+output/
